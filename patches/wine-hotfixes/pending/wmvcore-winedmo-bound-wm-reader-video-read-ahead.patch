@@ -1,4 +1,4 @@
-From 541b634193a1f19ecb7b8dea21682c42410983ab Mon Sep 17 00:00:00 2001
+From 249d75d9cef77bc1919a3b82ee3640f3a7714e0f Mon Sep 17 00:00:00 2001
 From: measlesbagel <49631653+measlesbagel@users.noreply.github.com>
 Date: Wed, 25 Nov 2026 19:59:50 -0600
 Subject: [PATCH] wmvcore, winedmo: Bound the WM reader's read-ahead of decoded
@@ -19,24 +19,31 @@ delivered in five seconds) until Android's low memory killer ends it.
 Stop taking a stream's samples while three wait for its delivery thread,
 and also stop decoding ahead once 128 MB of a stream's samples are
 queued (with at least four of them), keeping the 256 frame limit.
+
+The demux thread feeds every stream, so it must not wait for room in one
+stream's queue while another selected stream's reader waits for a packet:
+the async reader's read thread for that stream then never returns, and
+closing the reader waits for it forever. Count the readers waiting on an
+empty queue, and keep demuxing past the limit while another stream has one.
 ---
- dlls/winedmo/wm_reader.c    |  9 ++++++++-
+ dlls/winedmo/wm_reader.c    | 31 ++++++++++++++++++++++++++++++-
  dlls/wmvcore/async_reader.c | 15 +++++++++++++++
- 2 files changed, 23 insertions(+), 1 deletion(-)
+ 2 files changed, 45 insertions(+), 1 deletion(-)
 
 diff --git a/dlls/winedmo/wm_reader.c b/dlls/winedmo/wm_reader.c
-index 99c6437..580bbdb 100644
+index 99c6437..78783f2 100644
 --- a/dlls/winedmo/wm_reader.c
 +++ b/dlls/winedmo/wm_reader.c
-@@ -56,6 +56,7 @@ struct wm_stream
+@@ -56,6 +56,8 @@ struct wm_stream
      CRITICAL_SECTION queue_cs;
      CONDITION_VARIABLE queue_cv;
      UINT queued_packets;
 +    SIZE_T queued_bytes;
++    LONG waiting_reads;
      bool queue_eos;
      bool queue_flushing;
  
-@@ -1014,6 +1015,7 @@ static void wm_flush_stream_queue(struct wm_stream *stream)
+@@ -1014,6 +1016,7 @@ static void wm_flush_stream_queue(struct wm_stream *stream)
          free(pkt);
      }
      stream->queued_packets = 0;
@@ -44,17 +51,41 @@ index 99c6437..580bbdb 100644
      stream->queue_eos = false;
      LeaveCriticalSection(&stream->queue_cs);
      WakeAllConditionVariable(&stream->queue_cv);
-@@ -1038,7 +1040,8 @@ static BOOL wm_stream_wait_queue_space(struct wm_reader *reader, struct wm_strea
+@@ -1027,6 +1030,22 @@ static void wm_flush_stream_queue(struct wm_stream *stream)
+     LeaveCriticalSection(&stream->read_cs);
+ }
+ 
++/* The demux thread feeds every stream: while another one's reader waits for a
++ * packet, queueing past the limit is the only way either of them gets one. */
++static BOOL wm_reader_other_stream_starved(struct wm_reader *reader, struct wm_stream *stream)
++{
++    WORD i;
++
++    for (i = 0; i < reader->stream_count; ++i)
++    {
++        struct wm_stream *other = &reader->streams[i];
++        if (other != stream && other->selection != WMT_OFF
++                && InterlockedCompareExchange(&other->waiting_reads, 0, 0))
++            return TRUE;
++    }
++    return FALSE;
++}
++
+ static BOOL wm_stream_wait_queue_space(struct wm_reader *reader, struct wm_stream *stream)
+ {
+     if (!IsEqualGUID(&stream->major_type, &MFMediaType_Video))
+@@ -1038,7 +1057,9 @@ static BOOL wm_stream_wait_queue_space(struct wm_reader *reader, struct wm_strea
       * unbounded. */
      EnterCriticalSection(&stream->queue_cs);
      while (!reader->demux_shutdown && !stream->queue_flushing
 -            && stream->selection != WMT_OFF && stream->queued_packets >= 256)
 +            && stream->selection != WMT_OFF && (stream->queued_packets >= 256
-+            || (stream->queued_packets >= 4 && stream->queued_bytes >= (128 << 20))))
++            || (stream->queued_packets >= 4 && stream->queued_bytes >= (128 << 20)))
++            && !wm_reader_other_stream_starved(reader, stream))
          SleepConditionVariableCS(&stream->queue_cv, &stream->queue_cs, 10);
  
      if (reader->demux_shutdown || stream->queue_flushing || stream->selection == WMT_OFF)
-@@ -1186,6 +1189,7 @@ static DWORD CALLBACK wm_demux_thread(void *arg)
+@@ -1186,6 +1207,7 @@ static DWORD CALLBACK wm_demux_thread(void *arg)
                              {
                                  list_add_tail(&s->packet_queue, &pkt->entry);
                                  ++s->queued_packets;
@@ -62,7 +93,7 @@ index 99c6437..580bbdb 100644
                                  LeaveCriticalSection(&s->queue_cs);
                                  WakeConditionVariable(&s->queue_cv);
                              }
-@@ -1348,6 +1352,7 @@ static DWORD CALLBACK wm_demux_thread(void *arg)
+@@ -1348,6 +1370,7 @@ static DWORD CALLBACK wm_demux_thread(void *arg)
                      {
                          list_add_tail(&s->packet_queue, &pkt->entry);
                          ++s->queued_packets;
@@ -70,7 +101,7 @@ index 99c6437..580bbdb 100644
                          LeaveCriticalSection(&s->queue_cs);
                          WakeConditionVariable(&s->queue_cv);
                      }
-@@ -1390,6 +1395,7 @@ static DWORD CALLBACK wm_demux_thread(void *arg)
+@@ -1390,6 +1413,7 @@ static DWORD CALLBACK wm_demux_thread(void *arg)
              {
                  list_add_tail(&s->packet_queue, &pkt->entry);
                  ++s->queued_packets;
@@ -78,7 +109,19 @@ index 99c6437..580bbdb 100644
                  LeaveCriticalSection(&s->queue_cs);
                  WakeConditionVariable(&s->queue_cv);
              }
-@@ -2477,6 +2483,7 @@ static HRESULT wm_stream_dequeue_sample(struct wm_stream *stream, BYTE **data, U
+@@ -2459,7 +2483,11 @@ static HRESULT wm_stream_dequeue_sample(struct wm_stream *stream, BYTE **data, U
+ 
+     EnterCriticalSection(&stream->queue_cs);
+     while (list_empty(&stream->packet_queue) && !stream->queue_eos && !stream->queue_flushing)
++    {
++        InterlockedIncrement(&stream->waiting_reads);
+         SleepConditionVariableCS(&stream->queue_cv, &stream->queue_cs, INFINITE);
++        InterlockedDecrement(&stream->waiting_reads);
++    }
+ 
+     if (stream->queue_flushing)
+     {
+@@ -2477,6 +2505,7 @@ static HRESULT wm_stream_dequeue_sample(struct wm_stream *stream, BYTE **data, U
      list_remove(&pkt->entry);
      if (stream->queued_packets)
          --stream->queued_packets;
