@@ -1,0 +1,432 @@
+From 12bdda211ba48d76efb7d27a57e2b3fb5b39c04f Mon Sep 17 00:00:00 2001
+From: measlesbagel <49631653+measlesbagel@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 10:33:42 -0600
+Subject: [PATCH] winedmo: Keep a video backlog compressed while another stream
+ needs data.
+
+With 0135, the demux thread keeps reading past a full video queue while
+another stream's reader waits for a packet, so audio plays on time when
+video is consumed slower than real time. The video it reads meanwhile is
+decoded and queued, about 8 MB a frame at 1080p, so memory still grows by
+gigabytes a minute.
+
+Once a video stream's queue is full, queue its samples compressed instead
+and decode them as the queue drains, as Windows decodes on demand. At end
+of file, finish the other streams first so their readers stop waiting,
+then decode the backlog with the usual wait for room.
+---
+ dlls/winedmo/wm_reader.c | 316 +++++++++++++++++++++++++++------------
+ 1 file changed, 220 insertions(+), 96 deletions(-)
+
+diff --git a/dlls/winedmo/wm_reader.c b/dlls/winedmo/wm_reader.c
+index f23a3fc..02a5b0e 100644
+--- a/dlls/winedmo/wm_reader.c
++++ b/dlls/winedmo/wm_reader.c
+@@ -53,6 +53,7 @@ struct wm_stream
+ 
+     /* Per-stream packet queue */
+     struct list packet_queue;
++    struct list backlog; /* compressed samples waiting for room in packet_queue */
+     CRITICAL_SECTION queue_cs;
+     CONDITION_VARIABLE queue_cv;
+     UINT queued_packets;
+@@ -143,6 +144,16 @@ struct wm_packet
+     DWORD flags;    /* WM_SF_* flags */
+ };
+ 
++struct wm_backlog_packet
++{
++    struct list entry;
++    BYTE *data;
++    DWORD size;
++    INT64 pts, duration;
++    DWORD flags; /* WINEDMO_SAMPLE_FLAG_* flags */
++    unsigned int generation;
++};
++
+ /* ========================================================================
+  * IMediaBuffer — lightweight wrapper for winedmo_demuxer_read
+  * ======================================================================== */
+@@ -1006,6 +1017,7 @@ static NTSTATUS CDECL wm_stream_read_cb(struct winedmo_stream *ws, BYTE *buffer,
+ 
+ static void wm_flush_stream_queue(struct wm_stream *stream)
+ {
++    struct wm_backlog_packet *backlog, *next_backlog;
+     struct wm_packet *pkt, *next;
+ 
+     EnterCriticalSection(&stream->queue_cs);
+@@ -1015,6 +1027,12 @@ static void wm_flush_stream_queue(struct wm_stream *stream)
+         free(pkt->data);
+         free(pkt);
+     }
++    LIST_FOR_EACH_ENTRY_SAFE(backlog, next_backlog, &stream->backlog, struct wm_backlog_packet, entry)
++    {
++        list_remove(&backlog->entry);
++        free(backlog->data);
++        free(backlog);
++    }
+     stream->queued_packets = 0;
+     stream->queued_bytes = 0;
+     stream->queue_eos = false;
+@@ -1030,6 +1048,12 @@ static void wm_flush_stream_queue(struct wm_stream *stream)
+     LeaveCriticalSection(&stream->read_cs);
+ }
+ 
++static BOOL wm_stream_queue_full(struct wm_stream *stream)
++{
++    return stream->queued_packets >= 256
++            || (stream->queued_packets >= 4 && stream->queued_bytes >= (128 << 20));
++}
++
+ /* One demux thread feeds every stream: don't let a full queue starve another one. */
+ static BOOL wm_reader_other_stream_starved(struct wm_reader *reader, struct wm_stream *stream)
+ {
+@@ -1056,8 +1080,7 @@ static BOOL wm_stream_wait_queue_space(struct wm_reader *reader, struct wm_strea
+      * unbounded. */
+     EnterCriticalSection(&stream->queue_cs);
+     while (!reader->demux_shutdown && !stream->queue_flushing
+-            && stream->selection != WMT_OFF && (stream->queued_packets >= 256
+-            || (stream->queued_packets >= 4 && stream->queued_bytes >= (128 << 20)))
++            && stream->selection != WMT_OFF && wm_stream_queue_full(stream)
+             && !wm_reader_other_stream_starved(reader, stream))
+         SleepConditionVariableCS(&stream->queue_cv, &stream->queue_cs, 10);
+ 
+@@ -1071,6 +1094,182 @@ static BOOL wm_stream_wait_queue_space(struct wm_reader *reader, struct wm_strea
+     return TRUE;
+ }
+ 
++/* Pushes one compressed sample into the stream's decoder and queues what it
++ * outputs. Called with the stream's decoder lock held. */
++static void wm_stream_decode(struct wm_reader *reader, struct wm_stream *s, const BYTE *src, DWORD data_len,
++        INT64 in_pts, INT64 in_dur, DWORD in_flags)
++{
++    UINT32 dec_size = winedmo_format_get_max_size(&s->decoded_winedmo_format);
++    struct wm_packet *pkt;
++    NTSTATUS dec_status;
++
++    if (!dec_size) dec_size = 0x40000;
++    if ((in_flags & WINEDMO_SAMPLE_FLAG_SYNC_POINT) && IsEqualGUID(&s->major_type, &MFMediaType_Video))
++        s->next_decoded_cleanpoint = true;
++
++    if ((dec_status = winedmo_transform_push_input(s->decoder, (BYTE *)src, data_len,
++            in_pts, INT64_MIN, in_dur, in_flags))
++            && dec_status != STATUS_DEVICE_BUSY)
++    {
++        WARN("push_input failed for stream %u: %#lx\n", s->index, dec_status);
++        return;
++    }
++
++    for (;;)
++    {
++        INT64 dec_pts, dec_dur;
++        UINT32 out_size = dec_size;
++        DWORD dec_flags;
++        BYTE *dec_buf;
++
++        if (!out_size) out_size = winedmo_format_get_max_size(&s->decoded_winedmo_format);
++        if (!out_size) out_size = 0x40000;
++
++        if (!wm_stream_wait_queue_space(reader, s) || !(dec_buf = malloc(out_size)))
++            break;
++
++        dec_status = winedmo_transform_get_output(s->decoder, dec_buf, &out_size,
++                                                  &dec_pts, &dec_dur, &dec_flags);
++        if (dec_status == STATUS_BUFFER_TOO_SMALL)
++        {
++            /* dec_size updated by transform; retry with that allocation */
++            dec_size = out_size;
++            free(dec_buf);
++            continue;
++        }
++        if (dec_status != STATUS_SUCCESS)
++        {
++            free(dec_buf);
++            break;
++        }
++
++        if (dec_flags & WINEDMO_SAMPLE_FLAG_FORMAT_CHANGED || !out_size)
++        {
++            /* format change: frame_pending stays true, re-read on next iteration */
++            free(dec_buf);
++            continue;
++        }
++        if (!wm_stream_update_decoded_video_timing(s, &dec_pts, &dec_dur))
++        {
++            free(dec_buf);
++            continue;
++        }
++
++        if ((pkt = malloc(sizeof(*pkt))))
++        {
++            pkt->data = dec_buf;
++            pkt->size = out_size;
++            pkt->pts = dec_pts;
++            pkt->duration = dec_dur;
++            pkt->flags = 0;
++            if (IsEqualGUID(&s->major_type, &MFMediaType_Video))
++                pkt->flags |= WM_SF_CLEANPOINT;
++            if (dec_flags & WINEDMO_SAMPLE_FLAG_SYNC_POINT) pkt->flags |= WM_SF_CLEANPOINT;
++            if (s->next_decoded_cleanpoint)
++            {
++                pkt->flags |= WM_SF_CLEANPOINT;
++                s->next_decoded_cleanpoint = false;
++            }
++            if (dec_flags & WINEDMO_SAMPLE_FLAG_DISCONTINUITY) pkt->flags |= WM_SF_DISCONTINUITY;
++            EnterCriticalSection(&s->queue_cs);
++            if (!s->queue_flushing)
++            {
++                list_add_tail(&s->packet_queue, &pkt->entry);
++                ++s->queued_packets;
++                s->queued_bytes += pkt->size;
++                LeaveCriticalSection(&s->queue_cs);
++                WakeConditionVariable(&s->queue_cv);
++            }
++            else
++            {
++                LeaveCriticalSection(&s->queue_cs);
++                free(pkt->data);
++                free(pkt);
++            }
++        }
++        else
++            free(dec_buf);
++    }
++}
++
++/* Decoded video is large: while a video stream's queue is full, keep its samples
++ * compressed, so what the demux thread reads ahead for the other streams stays small. */
++static BOOL wm_stream_backlog_sample(struct wm_reader *reader, struct wm_stream *s, const BYTE *src,
++        DWORD size, INT64 pts, INT64 duration, DWORD flags)
++{
++    struct wm_backlog_packet *packet;
++    BOOL queued = FALSE;
++
++    if (!IsEqualGUID(&s->major_type, &MFMediaType_Video))
++        return FALSE;
++
++    EnterCriticalSection(&s->queue_cs);
++    if ((!list_empty(&s->backlog) || wm_stream_queue_full(s)) && (packet = malloc(sizeof(*packet))))
++    {
++        if ((packet->data = malloc(size)))
++        {
++            memcpy(packet->data, src, size);
++            packet->size = size;
++            packet->pts = pts;
++            packet->duration = duration;
++            packet->flags = flags;
++            packet->generation = reader->read_flush_generation;
++            list_add_tail(&s->backlog, &packet->entry);
++            queued = TRUE;
++        }
++        else
++            free(packet);
++    }
++    LeaveCriticalSection(&s->queue_cs);
++    return queued;
++}
++
++/* Decodes backlogged samples while the stream's queue has room; returns how many. */
++static unsigned int wm_stream_decode_backlog(struct wm_reader *reader, struct wm_stream *s)
++{
++    struct wm_backlog_packet *packet;
++    unsigned int count = 0;
++
++    for (;;)
++    {
++        EnterCriticalSection(&s->queue_cs);
++        if (list_empty(&s->backlog) || wm_stream_queue_full(s))
++        {
++            LeaveCriticalSection(&s->queue_cs);
++            return count;
++        }
++        packet = LIST_ENTRY(list_head(&s->backlog), struct wm_backlog_packet, entry);
++        list_remove(&packet->entry);
++        LeaveCriticalSection(&s->queue_cs);
++
++        EnterCriticalSection(&s->decoder_cs);
++        if (packet->generation == reader->read_flush_generation && !reader->read_flushing)
++            wm_stream_decode(reader, s, packet->data, packet->size, packet->pts, packet->duration, packet->flags);
++        LeaveCriticalSection(&s->decoder_cs);
++        free(packet->data);
++        free(packet);
++        ++count;
++    }
++}
++
++/* Before reading on, decode what the streams' queues have room for; a stream whose
++ * backlog doesn't fit waits for room, unless another stream's reader needs data. */
++static void wm_reader_decode_backlogs(struct wm_reader *reader)
++{
++    WORD i;
++
++    for (i = 0; i < reader->stream_count; ++i)
++    {
++        struct wm_stream *s = &reader->streams[i];
++
++        if (s->selection == WMT_OFF || list_empty(&s->backlog))
++            continue;
++        wm_stream_decode_backlog(reader, s);
++        if (!list_empty(&s->backlog))
++            wm_stream_wait_queue_space(reader, s);
++    }
++}
++
+ static DWORD CALLBACK wm_demux_thread(void *arg)
+ {
+     struct wm_reader *reader = arg;
+@@ -1097,6 +1296,10 @@ static DWORD CALLBACK wm_demux_thread(void *arg)
+             continue;
+         }
+ 
++        wm_reader_decode_backlogs(reader);
++        if (reader->demux_shutdown || reader->read_flushing)
++            continue;
++
+         if (!(sbuf = wm_simple_buffer_create(buffer_size)))
+         {
+             Sleep(1);
+@@ -1130,11 +1333,16 @@ static DWORD CALLBACK wm_demux_thread(void *arg)
+                 Sleep(1);
+                 continue; /* fake EOF from flushing, loop and wait */
+             }
+-            /* Real EOF: drain decoders and signal all streams */
++            /* Real EOF: drain decoders and signal all streams. Streams with a backlog
++             * go last, once the other streams' readers no longer wait for data. */
+             TRACE("Demuxer reached end of file.\n");
+-            for (UINT i = 0; i < reader->stream_count; i++)
++            for (UINT j = 0; j < 2 * reader->stream_count; j++)
+             {
++                UINT i = j % reader->stream_count;
++
+                 s = &reader->streams[i];
++                if (list_empty(&s->backlog) == (j >= reader->stream_count))
++                    continue;
+                 if (s->selection == WMT_OFF)
+                 {
+                     EnterCriticalSection(&s->queue_cs);
+@@ -1143,6 +1351,11 @@ static DWORD CALLBACK wm_demux_thread(void *arg)
+                     WakeAllConditionVariable(&s->queue_cv);
+                     continue;
+                 }
++                while (!list_empty(&s->backlog) && wm_stream_wait_queue_space(reader, s))
++                {
++                    if (!wm_stream_decode_backlog(reader, s))
++                        Sleep(1);
++                }
+                 EnterCriticalSection(&s->decoder_cs);
+                 if (s->decode_stream && s->decoder.handle)
+                 {
+@@ -1289,100 +1502,10 @@ static DWORD CALLBACK wm_demux_thread(void *arg)
+             INT64 in_dur = (output.dwStatus & DMO_OUTPUT_DATA_BUFFERF_TIMELENGTH) ? output.rtTimelength : 0;
+             DWORD in_flags = (output.dwStatus & DMO_OUTPUT_DATA_BUFFERF_SYNCPOINT ? WINEDMO_SAMPLE_FLAG_SYNC_POINT : 0)
+                            | (output.dwStatus & DMO_OUTPUT_DATA_BUFFERF_DISCONTINUITY ? WINEDMO_SAMPLE_FLAG_DISCONTINUITY : 0);
+-            UINT32 dec_size = winedmo_format_get_max_size(&s->decoded_winedmo_format);
+-            NTSTATUS dec_status;
+-
+-            if (!dec_size) dec_size = 0x40000;
+-            if ((in_flags & WINEDMO_SAMPLE_FLAG_SYNC_POINT) && IsEqualGUID(&s->major_type, &MFMediaType_Video))
+-                s->next_decoded_cleanpoint = true;
+ 
+-            if ((dec_status = winedmo_transform_push_input(s->decoder, src, data_len,
+-                    in_pts, INT64_MIN, in_dur, in_flags))
+-                    && dec_status != STATUS_DEVICE_BUSY)
+-            {
+-                WARN("push_input failed for stream %u: %#lx\n", stream_idx, dec_status);
+-                IMediaBuffer_Release(&sbuf->IMediaBuffer_iface);
+-                LeaveCriticalSection(&s->decoder_cs);
+-                continue;
+-            }
+-            /* src is no longer needed after push_input copies the data */
++            if (!wm_stream_backlog_sample(reader, s, src, data_len, in_pts, in_dur, in_flags))
++                wm_stream_decode(reader, s, src, data_len, in_pts, in_dur, in_flags);
+             IMediaBuffer_Release(&sbuf->IMediaBuffer_iface);
+-
+-            for (;;)
+-            {
+-                INT64 dec_pts, dec_dur;
+-                UINT32 out_size = dec_size;
+-                DWORD dec_flags;
+-                BYTE *dec_buf;
+-
+-                if (!out_size) out_size = winedmo_format_get_max_size(&s->decoded_winedmo_format);
+-                if (!out_size) out_size = 0x40000;
+-
+-                if (!wm_stream_wait_queue_space(reader, s) || !(dec_buf = malloc(out_size)))
+-                    break;
+-
+-                dec_status = winedmo_transform_get_output(s->decoder, dec_buf, &out_size,
+-                                                          &dec_pts, &dec_dur, &dec_flags);
+-                if (dec_status == STATUS_BUFFER_TOO_SMALL)
+-                {
+-                    /* dec_size updated by transform; retry with that allocation */
+-                    dec_size = out_size;
+-                    free(dec_buf);
+-                    continue;
+-                }
+-                if (dec_status != STATUS_SUCCESS)
+-                {
+-                    free(dec_buf);
+-                    break;
+-                }
+-
+-                if (dec_flags & WINEDMO_SAMPLE_FLAG_FORMAT_CHANGED || !out_size)
+-                {
+-                    /* format change: frame_pending stays true, re-read on next iteration */
+-                    free(dec_buf);
+-                    continue;
+-                }
+-                if (!wm_stream_update_decoded_video_timing(s, &dec_pts, &dec_dur))
+-                {
+-                    free(dec_buf);
+-                    continue;
+-                }
+-
+-                if ((pkt = malloc(sizeof(*pkt))))
+-                {
+-                    pkt->data = dec_buf;
+-                    pkt->size = out_size;
+-                    pkt->pts = dec_pts;
+-                    pkt->duration = dec_dur;
+-                    pkt->flags = 0;
+-                    if (IsEqualGUID(&s->major_type, &MFMediaType_Video))
+-                        pkt->flags |= WM_SF_CLEANPOINT;
+-                    if (dec_flags & WINEDMO_SAMPLE_FLAG_SYNC_POINT) pkt->flags |= WM_SF_CLEANPOINT;
+-                    if (s->next_decoded_cleanpoint)
+-                    {
+-                        pkt->flags |= WM_SF_CLEANPOINT;
+-                        s->next_decoded_cleanpoint = false;
+-                    }
+-                    if (dec_flags & WINEDMO_SAMPLE_FLAG_DISCONTINUITY) pkt->flags |= WM_SF_DISCONTINUITY;
+-                    EnterCriticalSection(&s->queue_cs);
+-                    if (!s->queue_flushing)
+-                    {
+-                        list_add_tail(&s->packet_queue, &pkt->entry);
+-                        ++s->queued_packets;
+-                        s->queued_bytes += pkt->size;
+-                        LeaveCriticalSection(&s->queue_cs);
+-                        WakeConditionVariable(&s->queue_cv);
+-                    }
+-                    else
+-                    {
+-                        LeaveCriticalSection(&s->queue_cs);
+-                        free(pkt->data);
+-                        free(pkt);
+-                    }
+-                }
+-                else
+-                    free(dec_buf);
+-            }
+             LeaveCriticalSection(&s->decoder_cs);
+         }
+         else
+@@ -2347,6 +2470,7 @@ static HRESULT init_stream(struct wm_reader *reader)
+         stream->reader = reader;
+         stream->index = i;
+         list_init(&stream->packet_queue);
++        list_init(&stream->backlog);
+         InitializeCriticalSection(&stream->queue_cs);
+         InitializeCriticalSection(&stream->read_cs);
+         InitializeConditionVariable(&stream->queue_cv);
+-- 
+2.53.0
+
