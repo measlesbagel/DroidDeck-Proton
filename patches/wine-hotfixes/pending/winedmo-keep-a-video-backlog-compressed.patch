@@ -1,8 +1,8 @@
-From 76ccbedf8b422fe8f002ebd149ca6ba62005b656 Mon Sep 17 00:00:00 2001
+From 175927ae8ad936013f2b91a5e02bb58fbbbe2ee1 Mon Sep 17 00:00:00 2001
 From: measlesbagel <49631653+measlesbagel@users.noreply.github.com>
 Date: Thu, 26 Nov 2026 11:02:41 -0600
-Subject: [PATCH 2/2] winedmo: Keep a video backlog compressed while another
- stream needs data.
+Subject: [PATCH] winedmo: Keep a video backlog compressed while another stream
+ needs data.
 
 With 0135, the demux thread keeps reading past a full video queue while
 another stream's reader waits for a packet, so audio stays on time when
@@ -11,13 +11,14 @@ decoded and queued, about 8 MB a frame at 1080p, gigabytes a minute.
 
 Once a video stream's queue is full, keep its demuxed samples compressed
 in a backlog and decode them in order as the queue drains, as Windows
-decodes on demand. The end of file waits for the backlogs to drain.
+decodes on demand. At the end of the file, the other streams end at once;
+a stream with a backlog ends once it is decoded.
 ---
- dlls/winedmo/wm_reader.c | 108 +++++++++++++++++++++++++++++++++++++++
- 1 file changed, 108 insertions(+)
+ dlls/winedmo/wm_reader.c | 113 ++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 112 insertions(+), 1 deletion(-)
 
 diff --git a/dlls/winedmo/wm_reader.c b/dlls/winedmo/wm_reader.c
-index 06226c0..d01fc8c 100644
+index 06226c0..ae64927 100644
 --- a/dlls/winedmo/wm_reader.c
 +++ b/dlls/winedmo/wm_reader.c
 @@ -53,6 +53,7 @@ struct wm_stream
@@ -166,19 +167,35 @@ index 06226c0..d01fc8c 100644
          if (!(sbuf = wm_simple_buffer_create(buffer_size)))
          {
              Sleep(1);
-@@ -1135,6 +1230,11 @@ static DWORD CALLBACK wm_demux_thread(void *arg)
+@@ -1135,11 +1230,14 @@ static DWORD CALLBACK wm_demux_thread(void *arg)
                  Sleep(1);
                  continue; /* fake EOF from flushing, loop and wait */
+             }
+-            /* Real EOF: drain decoders and signal all streams */
++            /* Real EOF: drain decoders and signal all streams. A stream with backlogged
++             * video ends once its backlog is decoded; the others end now. */
+             TRACE("Demuxer reached end of file.\n");
+             for (UINT i = 0; i < reader->stream_count; i++)
+             {
+                 s = &reader->streams[i];
++                if (s->queue_eos || (s->selection != WMT_OFF && !list_empty(&s->backlog)))
++                    continue;
+                 if (s->selection == WMT_OFF)
+                 {
+                     EnterCriticalSection(&s->queue_cs);
+@@ -1232,6 +1330,11 @@ static DWORD CALLBACK wm_demux_thread(void *arg)
+                 LeaveCriticalSection(&s->queue_cs);
+                 WakeAllConditionVariable(&s->queue_cv);
              }
 +            if (wm_reader_has_backlog(reader))
 +            {
 +                Sleep(1);
-+                continue; /* decode the backlogged video before ending the streams */
++                continue;
 +            }
-             /* Real EOF: drain decoders and signal all streams */
-             TRACE("Demuxer reached end of file.\n");
-             for (UINT i = 0; i < reader->stream_count; i++)
-@@ -1256,6 +1356,7 @@ static DWORD CALLBACK wm_demux_thread(void *arg)
+             /* Wait for seek/shutdown */
+             while (!reader->demux_shutdown && reader->read_flush_generation == flush_generation)
+                 Sleep(10);
+@@ -1256,6 +1359,7 @@ static DWORD CALLBACK wm_demux_thread(void *arg)
              continue;
          }
  
@@ -186,7 +203,7 @@ index 06226c0..d01fc8c 100644
          if (read_generation != reader->read_flush_generation || reader->read_flushing)
          {
              IMediaBuffer_Release(&sbuf->IMediaBuffer_iface);
-@@ -1297,6 +1398,12 @@ static DWORD CALLBACK wm_demux_thread(void *arg)
+@@ -1297,6 +1401,12 @@ static DWORD CALLBACK wm_demux_thread(void *arg)
              UINT32 dec_size = winedmo_format_get_max_size(&s->decoded_winedmo_format);
              NTSTATUS dec_status;
  
@@ -199,7 +216,7 @@ index 06226c0..d01fc8c 100644
              if (!dec_size) dec_size = 0x40000;
              if ((in_flags & WINEDMO_SAMPLE_FLAG_SYNC_POINT) && IsEqualGUID(&s->major_type, &MFMediaType_Video))
                  s->next_decoded_cleanpoint = true;
-@@ -2352,6 +2459,7 @@ static HRESULT init_stream(struct wm_reader *reader)
+@@ -2352,6 +2462,7 @@ static HRESULT init_stream(struct wm_reader *reader)
          stream->reader = reader;
          stream->index = i;
          list_init(&stream->packet_queue);
