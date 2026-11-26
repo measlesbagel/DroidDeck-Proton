@@ -25,6 +25,7 @@ apply "$root/patches/wine-hotfixes/pending/ntdll-skip-xattr-queries-on-unsupport
 apply "$root/patches/wine-hotfixes/pending/ntdll-skip-listing-case-folding-dir-for-missing-file.patch"
 apply "$root/patches/wine-hotfixes/pending/winedmo-flush-parser-on-drain.patch"
 apply "$root/patches/wine-hotfixes/pending/winedmo-accept-input-after-drain.patch"
+apply "$root/patches/wine-hotfixes/pending/wmvcore-winedmo-bound-wm-reader-video-read-ahead.patch"
 apply "$root/patches/wine-hotfixes/pending/mmdevapi-skip-death-stranding-code-hooks-on-arm64ec.patch"
 apply "$root/patches/wine-hotfixes/pending/ntdll-arm64ec-get-context-null.patch"
 apply "$root/patches/wine-hotfixes/pending/ntdll-futex-entry-pool.patch"
