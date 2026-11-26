@@ -1,37 +1,28 @@
-From 249d75d9cef77bc1919a3b82ee3640f3a7714e0f Mon Sep 17 00:00:00 2001
+From b9e4897dcb72b656dc9fe0ad2851af66fc0acf98 Mon Sep 17 00:00:00 2001
 From: measlesbagel <49631653+measlesbagel@users.noreply.github.com>
 Date: Wed, 25 Nov 2026 19:59:50 -0600
 Subject: [PATCH] wmvcore, winedmo: Bound the WM reader's read-ahead of decoded
  video.
 
-The ASF Reader hands samples over as soon as they are read and lets the
-renderers pace them by blocking in Receive() (ge-video-rework 0121), on a
-delivery thread of their own (0120). Video comes from the WM reader's own
-buffers, so the downstream allocator no longer blocks the reads either.
-A renderer slower than the stream then only blocks its delivery thread:
-the callback thread keeps reading and queueing samples for it without
-limit, and the demux thread decodes up to 256 frames ahead.
+With 0120 and 0121, qasf delivers each output on its own thread as soon as
+a sample is read, and renderers pace delivery by blocking in Receive().
+Video uses the reader's own buffers, so nothing paces the reads: a
+renderer slower than the stream lets the async reader queue samples for
+its delivery thread without limit, and the demux thread decodes up to 256
+frames ahead. Ys VIII's 1080p WMV opening grows the game by about 700 MB/s.
 
-Ys VIII's 1920x1080 WMV opening movie, drawn by the game at about 40 fps,
-grows the process by about 700 MB/s that way (575 frames read, 170
-delivered in five seconds) until Android's low memory killer ends it.
-
-Stop taking a stream's samples while three wait for its delivery thread,
-and also stop decoding ahead once 128 MB of a stream's samples are
-queued (with at least four of them), keeping the 256 frame limit.
-
-The demux thread feeds every stream, so it must not wait for room in one
-stream's queue while another selected stream's reader waits for a packet:
-the async reader's read thread for that stream then never returns, and
-closing the reader waits for it forever. Count the readers waiting on an
-empty queue, and keep demuxing past the limit while another stream has one.
+Stop reading a stream while three samples wait for its delivery thread,
+and stop decoding ahead once 128 MB of a stream are queued (at least four
+samples). Keep demuxing past that limit while another selected stream's
+reader waits for a packet, so a full queue can't starve the other streams
+and hang the reader on close.
 ---
- dlls/winedmo/wm_reader.c    | 31 ++++++++++++++++++++++++++++++-
- dlls/wmvcore/async_reader.c | 15 +++++++++++++++
- 2 files changed, 45 insertions(+), 1 deletion(-)
+ dlls/winedmo/wm_reader.c    | 30 +++++++++++++++++++++++++++++-
+ dlls/wmvcore/async_reader.c | 13 +++++++++++++
+ 2 files changed, 42 insertions(+), 1 deletion(-)
 
 diff --git a/dlls/winedmo/wm_reader.c b/dlls/winedmo/wm_reader.c
-index 99c6437..78783f2 100644
+index 99c6437..f23a3fc 100644
 --- a/dlls/winedmo/wm_reader.c
 +++ b/dlls/winedmo/wm_reader.c
 @@ -56,6 +56,8 @@ struct wm_stream
@@ -51,12 +42,11 @@ index 99c6437..78783f2 100644
      stream->queue_eos = false;
      LeaveCriticalSection(&stream->queue_cs);
      WakeAllConditionVariable(&stream->queue_cv);
-@@ -1027,6 +1030,22 @@ static void wm_flush_stream_queue(struct wm_stream *stream)
+@@ -1027,6 +1030,21 @@ static void wm_flush_stream_queue(struct wm_stream *stream)
      LeaveCriticalSection(&stream->read_cs);
  }
  
-+/* The demux thread feeds every stream: while another one's reader waits for a
-+ * packet, queueing past the limit is the only way either of them gets one. */
++/* One demux thread feeds every stream: don't let a full queue starve another one. */
 +static BOOL wm_reader_other_stream_starved(struct wm_reader *reader, struct wm_stream *stream)
 +{
 +    WORD i;
@@ -74,7 +64,7 @@ index 99c6437..78783f2 100644
  static BOOL wm_stream_wait_queue_space(struct wm_reader *reader, struct wm_stream *stream)
  {
      if (!IsEqualGUID(&stream->major_type, &MFMediaType_Video))
-@@ -1038,7 +1057,9 @@ static BOOL wm_stream_wait_queue_space(struct wm_reader *reader, struct wm_strea
+@@ -1038,7 +1056,9 @@ static BOOL wm_stream_wait_queue_space(struct wm_reader *reader, struct wm_strea
       * unbounded. */
      EnterCriticalSection(&stream->queue_cs);
      while (!reader->demux_shutdown && !stream->queue_flushing
@@ -85,7 +75,7 @@ index 99c6437..78783f2 100644
          SleepConditionVariableCS(&stream->queue_cv, &stream->queue_cs, 10);
  
      if (reader->demux_shutdown || stream->queue_flushing || stream->selection == WMT_OFF)
-@@ -1186,6 +1207,7 @@ static DWORD CALLBACK wm_demux_thread(void *arg)
+@@ -1186,6 +1206,7 @@ static DWORD CALLBACK wm_demux_thread(void *arg)
                              {
                                  list_add_tail(&s->packet_queue, &pkt->entry);
                                  ++s->queued_packets;
@@ -93,7 +83,7 @@ index 99c6437..78783f2 100644
                                  LeaveCriticalSection(&s->queue_cs);
                                  WakeConditionVariable(&s->queue_cv);
                              }
-@@ -1348,6 +1370,7 @@ static DWORD CALLBACK wm_demux_thread(void *arg)
+@@ -1348,6 +1369,7 @@ static DWORD CALLBACK wm_demux_thread(void *arg)
                      {
                          list_add_tail(&s->packet_queue, &pkt->entry);
                          ++s->queued_packets;
@@ -101,7 +91,7 @@ index 99c6437..78783f2 100644
                          LeaveCriticalSection(&s->queue_cs);
                          WakeConditionVariable(&s->queue_cv);
                      }
-@@ -1390,6 +1413,7 @@ static DWORD CALLBACK wm_demux_thread(void *arg)
+@@ -1390,6 +1412,7 @@ static DWORD CALLBACK wm_demux_thread(void *arg)
              {
                  list_add_tail(&s->packet_queue, &pkt->entry);
                  ++s->queued_packets;
@@ -109,7 +99,7 @@ index 99c6437..78783f2 100644
                  LeaveCriticalSection(&s->queue_cs);
                  WakeConditionVariable(&s->queue_cv);
              }
-@@ -2459,7 +2483,11 @@ static HRESULT wm_stream_dequeue_sample(struct wm_stream *stream, BYTE **data, U
+@@ -2459,7 +2482,11 @@ static HRESULT wm_stream_dequeue_sample(struct wm_stream *stream, BYTE **data, U
  
      EnterCriticalSection(&stream->queue_cs);
      while (list_empty(&stream->packet_queue) && !stream->queue_eos && !stream->queue_flushing)
@@ -121,7 +111,7 @@ index 99c6437..78783f2 100644
  
      if (stream->queue_flushing)
      {
-@@ -2477,6 +2505,7 @@ static HRESULT wm_stream_dequeue_sample(struct wm_stream *stream, BYTE **data, U
+@@ -2477,6 +2504,7 @@ static HRESULT wm_stream_dequeue_sample(struct wm_stream *stream, BYTE **data, U
      list_remove(&pkt->entry);
      if (stream->queued_packets)
          --stream->queued_packets;
@@ -130,23 +120,21 @@ index 99c6437..78783f2 100644
      LeaveCriticalSection(&stream->queue_cs);
  
 diff --git a/dlls/wmvcore/async_reader.c b/dlls/wmvcore/async_reader.c
-index 4cdda29..ec994d8 100644
+index 4cdda29..bdb82fc 100644
 --- a/dlls/wmvcore/async_reader.c
 +++ b/dlls/wmvcore/async_reader.c
-@@ -58,6 +58,12 @@ struct async_op
+@@ -58,6 +58,10 @@ struct async_op
      struct list entry;
  };
  
-+/* qasf delivers samples as soon as they are read and lets the renderers pace
-+ * them by blocking in Receive(); with a dedicated delivery thread that only
-+ * blocks the delivery thread, so stop taking a stream's samples while this
-+ * many wait for it. */
++/* Renderers pace qasf's samples by blocking in Receive(), which only blocks a
++ * dedicated delivery thread: stop reading a stream while this many wait for it. */
 +#define MAX_PENDING_DELIVERIES 3
 +
  struct sample
  {
      struct list entry;
-@@ -355,6 +361,9 @@ static void async_reader_deliver_sample(struct async_reader *reader, struct samp
+@@ -355,6 +359,9 @@ static void async_reader_deliver_sample(struct async_reader *reader, struct samp
      list_remove(&sample->entry);
      INSSBuffer_Release(sample->buffer);
      free(sample);
@@ -156,7 +144,7 @@ index 4cdda29..ec994d8 100644
  }
  
  static void stream_request_read(struct stream *stream)
-@@ -626,6 +635,12 @@ static HRESULT async_reader_get_next_sample(struct async_reader *reader,
+@@ -626,6 +633,12 @@ static HRESULT async_reader_get_next_sample(struct async_reader *reader,
          if (FAILED(IWMSyncReader2_GetStreamSelected(reader->reader, i + 1, &selection))
                  || selection == WMT_OFF)
              continue;
