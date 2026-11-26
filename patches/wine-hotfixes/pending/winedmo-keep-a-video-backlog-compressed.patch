@@ -1,8 +1,8 @@
-From c616a1a261759ef8d044d691672456172f6d6b3f Mon Sep 17 00:00:00 2001
+From 76ccbedf8b422fe8f002ebd149ca6ba62005b656 Mon Sep 17 00:00:00 2001
 From: measlesbagel <49631653+measlesbagel@users.noreply.github.com>
-Date: Thu, 26 Nov 2026 10:59:29 -0600
-Subject: [PATCH] winedmo: Keep a video backlog compressed while another stream
- needs data.
+Date: Thu, 26 Nov 2026 11:02:41 -0600
+Subject: [PATCH 2/2] winedmo: Keep a video backlog compressed while another
+ stream needs data.
 
 With 0135, the demux thread keeps reading past a full video queue while
 another stream's reader waits for a packet, so audio stays on time when
@@ -13,11 +13,11 @@ Once a video stream's queue is full, keep its demuxed samples compressed
 in a backlog and decode them in order as the queue drains, as Windows
 decodes on demand. The end of file waits for the backlogs to drain.
 ---
- dlls/winedmo/wm_reader.c | 117 ++++++++++++++++++++++++++++++++++++++-
- 1 file changed, 115 insertions(+), 2 deletions(-)
+ dlls/winedmo/wm_reader.c | 108 +++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 108 insertions(+)
 
 diff --git a/dlls/winedmo/wm_reader.c b/dlls/winedmo/wm_reader.c
-index f23a3fc..d01fc8c 100644
+index 06226c0..d01fc8c 100644
 --- a/dlls/winedmo/wm_reader.c
 +++ b/dlls/winedmo/wm_reader.c
 @@ -53,6 +53,7 @@ struct wm_stream
@@ -66,30 +66,7 @@ index f23a3fc..d01fc8c 100644
      stream->queued_packets = 0;
      stream->queued_bytes = 0;
      stream->queue_eos = false;
-@@ -1030,6 +1048,12 @@ static void wm_flush_stream_queue(struct wm_stream *stream)
-     LeaveCriticalSection(&stream->read_cs);
- }
- 
-+static BOOL wm_stream_queue_full(struct wm_stream *stream)
-+{
-+    return stream->queued_packets >= 256
-+            || (stream->queued_packets >= 4 && stream->queued_bytes >= (128 << 20));
-+}
-+
- /* One demux thread feeds every stream: don't let a full queue starve another one. */
- static BOOL wm_reader_other_stream_starved(struct wm_reader *reader, struct wm_stream *stream)
- {
-@@ -1056,8 +1080,7 @@ static BOOL wm_stream_wait_queue_space(struct wm_reader *reader, struct wm_strea
-      * unbounded. */
-     EnterCriticalSection(&stream->queue_cs);
-     while (!reader->demux_shutdown && !stream->queue_flushing
--            && stream->selection != WMT_OFF && (stream->queued_packets >= 256
--            || (stream->queued_packets >= 4 && stream->queued_bytes >= (128 << 20)))
-+            && stream->selection != WMT_OFF && wm_stream_queue_full(stream)
-             && !wm_reader_other_stream_starved(reader, stream))
-         SleepConditionVariableCS(&stream->queue_cv, &stream->queue_cs, 10);
- 
-@@ -1071,6 +1094,69 @@ static BOOL wm_stream_wait_queue_space(struct wm_reader *reader, struct wm_strea
+@@ -1076,6 +1094,69 @@ static BOOL wm_stream_wait_queue_space(struct wm_reader *reader, struct wm_strea
      return TRUE;
  }
  
@@ -159,7 +136,7 @@ index f23a3fc..d01fc8c 100644
  static DWORD CALLBACK wm_demux_thread(void *arg)
  {
      struct wm_reader *reader = arg;
-@@ -1080,8 +1166,10 @@ static DWORD CALLBACK wm_demux_thread(void *arg)
+@@ -1085,8 +1166,10 @@ static DWORD CALLBACK wm_demux_thread(void *arg)
  
      while (!reader->demux_shutdown)
      {
@@ -170,7 +147,7 @@ index f23a3fc..d01fc8c 100644
          UINT stream_idx, needed_size;
          NTSTATUS status;
          BYTE *src;
-@@ -1097,6 +1185,18 @@ static DWORD CALLBACK wm_demux_thread(void *arg)
+@@ -1102,6 +1185,18 @@ static DWORD CALLBACK wm_demux_thread(void *arg)
              continue;
          }
  
@@ -189,7 +166,7 @@ index f23a3fc..d01fc8c 100644
          if (!(sbuf = wm_simple_buffer_create(buffer_size)))
          {
              Sleep(1);
-@@ -1130,6 +1230,11 @@ static DWORD CALLBACK wm_demux_thread(void *arg)
+@@ -1135,6 +1230,11 @@ static DWORD CALLBACK wm_demux_thread(void *arg)
                  Sleep(1);
                  continue; /* fake EOF from flushing, loop and wait */
              }
@@ -201,7 +178,7 @@ index f23a3fc..d01fc8c 100644
              /* Real EOF: drain decoders and signal all streams */
              TRACE("Demuxer reached end of file.\n");
              for (UINT i = 0; i < reader->stream_count; i++)
-@@ -1251,6 +1356,7 @@ static DWORD CALLBACK wm_demux_thread(void *arg)
+@@ -1256,6 +1356,7 @@ static DWORD CALLBACK wm_demux_thread(void *arg)
              continue;
          }
  
@@ -209,7 +186,7 @@ index f23a3fc..d01fc8c 100644
          if (read_generation != reader->read_flush_generation || reader->read_flushing)
          {
              IMediaBuffer_Release(&sbuf->IMediaBuffer_iface);
-@@ -1292,6 +1398,12 @@ static DWORD CALLBACK wm_demux_thread(void *arg)
+@@ -1297,6 +1398,12 @@ static DWORD CALLBACK wm_demux_thread(void *arg)
              UINT32 dec_size = winedmo_format_get_max_size(&s->decoded_winedmo_format);
              NTSTATUS dec_status;
  
@@ -222,7 +199,7 @@ index f23a3fc..d01fc8c 100644
              if (!dec_size) dec_size = 0x40000;
              if ((in_flags & WINEDMO_SAMPLE_FLAG_SYNC_POINT) && IsEqualGUID(&s->major_type, &MFMediaType_Video))
                  s->next_decoded_cleanpoint = true;
-@@ -2347,6 +2459,7 @@ static HRESULT init_stream(struct wm_reader *reader)
+@@ -2352,6 +2459,7 @@ static HRESULT init_stream(struct wm_reader *reader)
          stream->reader = reader;
          stream->index = i;
          list_init(&stream->packet_queue);
