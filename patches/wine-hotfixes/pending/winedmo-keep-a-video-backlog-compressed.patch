@@ -1,4 +1,4 @@
-From 175927ae8ad936013f2b91a5e02bb58fbbbe2ee1 Mon Sep 17 00:00:00 2001
+From 2ecec92cf72b0c63c4ff210dbbe79a5c6e33ffc0 Mon Sep 17 00:00:00 2001
 From: measlesbagel <49631653+measlesbagel@users.noreply.github.com>
 Date: Thu, 26 Nov 2026 11:02:41 -0600
 Subject: [PATCH] winedmo: Keep a video backlog compressed while another stream
@@ -14,11 +14,11 @@ in a backlog and decode them in order as the queue drains, as Windows
 decodes on demand. At the end of the file, the other streams end at once;
 a stream with a backlog ends once it is decoded.
 ---
- dlls/winedmo/wm_reader.c | 113 ++++++++++++++++++++++++++++++++++++++-
- 1 file changed, 112 insertions(+), 1 deletion(-)
+ dlls/winedmo/wm_reader.c | 110 ++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 109 insertions(+), 1 deletion(-)
 
 diff --git a/dlls/winedmo/wm_reader.c b/dlls/winedmo/wm_reader.c
-index 06226c0..ae64927 100644
+index 06226c0..5ef7ddb 100644
 --- a/dlls/winedmo/wm_reader.c
 +++ b/dlls/winedmo/wm_reader.c
 @@ -53,6 +53,7 @@ struct wm_stream
@@ -183,19 +183,16 @@ index 06226c0..ae64927 100644
                  if (s->selection == WMT_OFF)
                  {
                      EnterCriticalSection(&s->queue_cs);
-@@ -1232,6 +1330,11 @@ static DWORD CALLBACK wm_demux_thread(void *arg)
+@@ -1232,6 +1330,8 @@ static DWORD CALLBACK wm_demux_thread(void *arg)
                  LeaveCriticalSection(&s->queue_cs);
                  WakeAllConditionVariable(&s->queue_cv);
              }
 +            if (wm_reader_has_backlog(reader))
-+            {
-+                Sleep(1);
-+                continue;
-+            }
++                continue; /* the loop decodes the backlog as room frees up, then ends the stream */
              /* Wait for seek/shutdown */
              while (!reader->demux_shutdown && reader->read_flush_generation == flush_generation)
                  Sleep(10);
-@@ -1256,6 +1359,7 @@ static DWORD CALLBACK wm_demux_thread(void *arg)
+@@ -1256,6 +1356,7 @@ static DWORD CALLBACK wm_demux_thread(void *arg)
              continue;
          }
  
@@ -203,7 +200,7 @@ index 06226c0..ae64927 100644
          if (read_generation != reader->read_flush_generation || reader->read_flushing)
          {
              IMediaBuffer_Release(&sbuf->IMediaBuffer_iface);
-@@ -1297,6 +1401,12 @@ static DWORD CALLBACK wm_demux_thread(void *arg)
+@@ -1297,6 +1398,12 @@ static DWORD CALLBACK wm_demux_thread(void *arg)
              UINT32 dec_size = winedmo_format_get_max_size(&s->decoded_winedmo_format);
              NTSTATUS dec_status;
  
@@ -216,7 +213,7 @@ index 06226c0..ae64927 100644
              if (!dec_size) dec_size = 0x40000;
              if ((in_flags & WINEDMO_SAMPLE_FLAG_SYNC_POINT) && IsEqualGUID(&s->major_type, &MFMediaType_Video))
                  s->next_decoded_cleanpoint = true;
-@@ -2352,6 +2462,7 @@ static HRESULT init_stream(struct wm_reader *reader)
+@@ -2352,6 +2459,7 @@ static HRESULT init_stream(struct wm_reader *reader)
          stream->reader = reader;
          stream->index = i;
          list_init(&stream->packet_queue);
